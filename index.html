@@ -1131,31 +1131,64 @@ const S = {
    Paste your Apps Script /exec URL below.
    Get it: Apps Script -> Deploy -> Manage Deployments -> copy URL
 ───────────────────────────────────────────────── */
-var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzFG-Bl_i0ehguVBUbteVcLT4-mJ5JrARbfLvt6mnJiZ3WMNRizpDNnkLctp6lYJhuZ/exec';
+var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyYVVp_uPQC4IdFS_CdwRkAS6FEpb1bAuKxcXFfUQmEoAtpqZXg9QFctB9MQjIoVn_R/exec';
 
 /* ─────────────────────────────────────────────────
-   SERVER CALLS — GET request to Apps Script doGet()
-   WHY GET: Apps Script redirects all requests.
-   POST bodies are dropped on redirect → HTTP 405.
-   GET params survive redirects perfectly.
+   SERVER CALLS — JSONP (bypasses CORS completely)
+   
+   fetch() fails from GitHub → Apps Script because
+   Apps Script does not return CORS headers.
+   
+   JSONP injects a <script src="url&callback=fn">
+   tag instead. Scripts load cross-origin freely.
+   Apps Script wraps the response as: fn({...json...})
+   which calls our waiting callback — no CORS needed.
 ───────────────────────────────────────────────── */
+var _cbCount = 0;
+
 function call(fnName) {
   var args = Array.prototype.slice.call(arguments, 1);
-  var url  = APPS_SCRIPT_URL
-             + '?fn=' + encodeURIComponent(fnName)
-             + '&p='  + encodeURIComponent(JSON.stringify(args));
-  return fetch(url, { method: 'GET', redirect: 'follow' })
-    .then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    })
-    .then(function(r) {
-      if (r && r.sessionExpired) doLogout();
-      return r;
-    })
-    .catch(function(e) {
-      return { ok: false, msg: 'Connection error: ' + e.message };
-    });
+
+  return new Promise(function(resolve) {
+    // Unique callback name for this request
+    var cbName = '_kvcb' + (++_cbCount) + '_' + Date.now();
+
+    // Timeout — clean up if Apps Script never responds
+    var timer = setTimeout(function() {
+      cleanup();
+      resolve({ ok: false, msg: 'Request timed out. Check your APPS_SCRIPT_URL.' });
+    }, 20000);
+
+    function cleanup() {
+      clearTimeout(timer);
+      try { delete window[cbName]; } catch(e) {}
+      var el = document.getElementById(cbName);
+      if (el) el.parentNode.removeChild(el);
+    }
+
+    // Register callback — Apps Script will call this with the result
+    window[cbName] = function(result) {
+      cleanup();
+      if (result && result.sessionExpired) doLogout();
+      resolve(result);
+    };
+
+    // Build URL: ?fn=svr_login&p=["admin","vault2024"]&callback=_kvcb1_...
+    var url = APPS_SCRIPT_URL
+      + '?fn='       + encodeURIComponent(fnName)
+      + '&p='        + encodeURIComponent(JSON.stringify(args))
+      + '&callback=' + encodeURIComponent(cbName);
+
+    // Inject script tag — loads cross-origin, no CORS block
+    var script = document.createElement('script');
+    script.id  = cbName;
+    script.src = url;
+    script.onerror = function() {
+      cleanup();
+      resolve({ ok: false, msg: 'Could not reach Apps Script. Check your APPS_SCRIPT_URL.' });
+    };
+    document.head.appendChild(script);
+  });
 }
 
 /* ─────────────────────────────────────────────────
