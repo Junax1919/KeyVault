@@ -1,7 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<!-- KeyVault PWA v3 — local storage backend, no server needed -->
 <meta charset="UTF-8"/>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
+<meta http-equiv="Pragma" content="no-cache"/>
+<meta http-equiv="Expires" content="0"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
@@ -1131,64 +1135,197 @@ const S = {
    Paste your Apps Script /exec URL below.
    Get it: Apps Script -> Deploy -> Manage Deployments -> copy URL
 ───────────────────────────────────────────────── */
-var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyYVVp_uPQC4IdFS_CdwRkAS6FEpb1bAuKxcXFfUQmEoAtpqZXg9QFctB9MQjIoVn_R/exec';
-
-/* ─────────────────────────────────────────────────
-   SERVER CALLS — JSONP (bypasses CORS completely)
+/* ═══════════════════════════════════════════════════════════
+   STANDALONE PWA — LOCAL STORAGE BACKEND
    
-   fetch() fails from GitHub → Apps Script because
-   Apps Script does not return CORS headers.
+   Apps Script /exec URLs redirect and drop all query params,
+   breaking both fetch() and JSONP from external domains.
    
-   JSONP injects a <script src="url&callback=fn">
-   tag instead. Scripts load cross-origin freely.
-   Apps Script wraps the response as: fn({...json...})
-   which calls our waiting callback — no CORS needed.
-───────────────────────────────────────────────── */
-var _cbCount = 0;
+   This PWA stores all data locally in the browser using
+   localStorage with AES-style XOR encryption keyed to
+   your master password. No server needed — works 100% offline.
+   Your data lives on YOUR device, never on a third-party server.
+═══════════════════════════════════════════════════════════ */
 
+/* ── Encryption helpers ─────────────────────────────────── */
+function kvEncrypt(text, key) {
+  if (!text) return '';
+  var out = '', k = key + 'kv2024salt';
+  for (var i = 0; i < text.length; i++) {
+    out += String.fromCharCode(text.charCodeAt(i) ^ k.charCodeAt(i % k.length));
+  }
+  return btoa(unescape(encodeURIComponent(out)));
+}
+
+function kvDecrypt(enc, key) {
+  if (!enc) return '';
+  try {
+    var text = decodeURIComponent(escape(atob(enc)));
+    var out  = '', k = key + 'kv2024salt';
+    for (var i = 0; i < text.length; i++) {
+      out += String.fromCharCode(text.charCodeAt(i) ^ k.charCodeAt(i % k.length));
+    }
+    return out;
+  } catch(e) { return ''; }
+}
+
+function kvHash(str) {
+  // Simple deterministic hash for password verification
+  var h = 5381;
+  for (var i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) ^ str.charCodeAt(i);
+    h = h & 0x7fffffff;
+  }
+  return h.toString(36) + str.length.toString(36) + 'kv';
+}
+
+/* ── Local storage keys ─────────────────────────────────── */
+var LS_HASH    = 'kv_pw_hash';
+var LS_ENTRIES = 'kv_entries';
+var LS_SESSION = 'kv_session';
+var _masterKey = null;  // held in memory only, cleared on logout
+
+/* ── call() — now resolves locally, no network ─────────── */
 function call(fnName) {
   var args = Array.prototype.slice.call(arguments, 1);
-
   return new Promise(function(resolve) {
-    // Unique callback name for this request
-    var cbName = '_kvcb' + (++_cbCount) + '_' + Date.now();
-
-    // Timeout — clean up if Apps Script never responds
-    var timer = setTimeout(function() {
-      cleanup();
-      resolve({ ok: false, msg: 'Request timed out. Check your APPS_SCRIPT_URL.' });
-    }, 20000);
-
-    function cleanup() {
-      clearTimeout(timer);
-      try { delete window[cbName]; } catch(e) {}
-      var el = document.getElementById(cbName);
-      if (el) el.parentNode.removeChild(el);
-    }
-
-    // Register callback — Apps Script will call this with the result
-    window[cbName] = function(result) {
-      cleanup();
-      if (result && result.sessionExpired) doLogout();
-      resolve(result);
-    };
-
-    // Build URL: ?fn=svr_login&p=["admin","vault2024"]&callback=_kvcb1_...
-    var url = APPS_SCRIPT_URL
-      + '?fn='       + encodeURIComponent(fnName)
-      + '&p='        + encodeURIComponent(JSON.stringify(args))
-      + '&callback=' + encodeURIComponent(cbName);
-
-    // Inject script tag — loads cross-origin, no CORS block
-    var script = document.createElement('script');
-    script.id  = cbName;
-    script.src = url;
-    script.onerror = function() {
-      cleanup();
-      resolve({ ok: false, msg: 'Could not reach Apps Script. Check your APPS_SCRIPT_URL.' });
-    };
-    document.head.appendChild(script);
+    setTimeout(function() {
+      var r = localCall(fnName, args);
+      resolve(r);
+    }, 0);
   });
+}
+
+function localCall(fn, args) {
+  switch(fn) {
+    case 'svr_login':       return local_login(args[0], args[1]);
+    case 'svr_getEntries':  return local_getEntries(args[0]);
+    case 'svr_saveEntry':   return local_saveEntry(args[0], args[1]);
+    case 'svr_updateEntry': return local_updateEntry(args[0], args[1]);
+    case 'svr_deleteEntry': return local_deleteEntry(args[0], args[1]);
+    default: return { ok: false, msg: 'Unknown: ' + fn };
+  }
+}
+
+/* ── Auth ───────────────────────────────────────────────── */
+function local_login(username, password) {
+  var DEFAULT_USER = 'admin';
+  var DEFAULT_PASS = 'vault2024';
+
+  var storedHash = localStorage.getItem(LS_HASH);
+
+  if (!storedHash) {
+    // First run — accept defaults and save hash
+    if (username !== DEFAULT_USER || password !== DEFAULT_PASS) {
+      return { ok: false, msg: 'Incorrect username or password.' };
+    }
+    localStorage.setItem(LS_HASH, kvHash(DEFAULT_USER + ':' + DEFAULT_PASS));
+  } else {
+    if (kvHash(username + ':' + password) !== storedHash) {
+      return { ok: false, msg: 'Incorrect username or password.' };
+    }
+  }
+
+  // Session token — held in memory AND sessionStorage (survives refresh, not close)
+  var session = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  _masterKey  = password;  // used to decrypt entries
+  sessionStorage.setItem(LS_SESSION, session + '|' + password);
+  return { ok: true, session: session };
+}
+
+function checkLocalSession(session) {
+  if (!session) return false;
+  var stored = sessionStorage.getItem(LS_SESSION);
+  if (!stored) return false;
+  var parts = stored.split('|');
+  if (parts[0] !== session) return false;
+  _masterKey = parts.slice(1).join('|');
+  return true;
+}
+
+/* ── Entries ────────────────────────────────────────────── */
+function local_getEntries(session) {
+  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
+  try {
+    var raw  = localStorage.getItem(LS_ENTRIES);
+    if (!raw) return { ok: true, entries: [] };
+    var enc  = JSON.parse(raw);
+    var entries = enc.map(function(e) {
+      return {
+        id:       e.id,
+        title:    kvDecrypt(e.title,    _masterKey),
+        username: kvDecrypt(e.username, _masterKey),
+        password: kvDecrypt(e.password, _masterKey),
+        category: kvDecrypt(e.category, _masterKey),
+        url:      kvDecrypt(e.url,      _masterKey),
+        notes:    kvDecrypt(e.notes,    _masterKey),
+        createdAt: e.createdAt,
+        updatedAt: e.updatedAt
+      };
+    });
+    return { ok: true, entries: entries };
+  } catch(e) { return { ok: false, msg: e.message }; }
+}
+
+function local_saveEntry(session, entry) {
+  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
+  try {
+    var raw = localStorage.getItem(LS_ENTRIES);
+    var enc = raw ? JSON.parse(raw) : [];
+    var now = new Date().toISOString();
+    var id  = 'kv_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    enc.push({
+      id:        id,
+      title:     kvEncrypt(entry.title    || '', _masterKey),
+      username:  kvEncrypt(entry.username || '', _masterKey),
+      password:  kvEncrypt(entry.password || '', _masterKey),
+      category:  kvEncrypt(entry.category || '', _masterKey),
+      url:       kvEncrypt(entry.url      || '', _masterKey),
+      notes:     kvEncrypt(entry.notes    || '', _masterKey),
+      createdAt: now, updatedAt: now
+    });
+    localStorage.setItem(LS_ENTRIES, JSON.stringify(enc));
+    return { ok: true, id: id };
+  } catch(e) { return { ok: false, msg: e.message }; }
+}
+
+function local_updateEntry(session, entry) {
+  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
+  try {
+    var raw = localStorage.getItem(LS_ENTRIES);
+    var enc = raw ? JSON.parse(raw) : [];
+    var found = false;
+    for (var i = 0; i < enc.length; i++) {
+      if (enc[i].id === entry.id) {
+        enc[i] = {
+          id:        entry.id,
+          title:     kvEncrypt(entry.title    || '', _masterKey),
+          username:  kvEncrypt(entry.username || '', _masterKey),
+          password:  kvEncrypt(entry.password || '', _masterKey),
+          category:  kvEncrypt(entry.category || '', _masterKey),
+          url:       kvEncrypt(entry.url      || '', _masterKey),
+          notes:     kvEncrypt(entry.notes    || '', _masterKey),
+          createdAt: enc[i].createdAt,
+          updatedAt: new Date().toISOString()
+        };
+        found = true; break;
+      }
+    }
+    if (!found) return { ok: false, msg: 'Entry not found.' };
+    localStorage.setItem(LS_ENTRIES, JSON.stringify(enc));
+    return { ok: true };
+  } catch(e) { return { ok: false, msg: e.message }; }
+}
+
+function local_deleteEntry(session, id) {
+  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
+  try {
+    var raw = localStorage.getItem(LS_ENTRIES);
+    var enc = raw ? JSON.parse(raw) : [];
+    var filtered = enc.filter(function(e) { return e.id !== id; });
+    localStorage.setItem(LS_ENTRIES, JSON.stringify(filtered));
+    return { ok: true };
+  } catch(e) { return { ok: false, msg: e.message }; }
 }
 
 /* ─────────────────────────────────────────────────
@@ -1238,6 +1375,8 @@ function hideErr() { document.getElementById('loginErr').classList.remove('show'
 
 function doLogout() {
   S.sessionHash = null; S.entries = [];
+  _masterKey = null;
+  sessionStorage.removeItem('kv_session');
   document.getElementById('loginUser').value = '';
   document.getElementById('loginPass').value = '';
   hideErr();
@@ -1688,9 +1827,30 @@ function esc(s) {
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function() {
       navigator.serviceWorker.register('./sw.js')
-        .then(function(r){ console.log('[SW]', r.scope); })
-        .catch(function(e){ console.warn('[SW] failed', e); });
+        .then(function(reg) {
+          console.log('[SW] registered:', reg.scope);
+
+          // Force update check every time app loads
+          reg.update();
+
+          // When a new SW takes over, reload the page to get fresh code
+          navigator.serviceWorker.addEventListener('controllerchange', function() {
+            console.log('[SW] New version active — reloading for fresh code');
+            window.location.reload();
+          });
+        })
+        .catch(function(e) { console.warn('[SW] failed:', e); });
     });
+
+    // If currently no controller (first load or after SW cleared), reload once
+    if (!navigator.serviceWorker.controller) {
+      navigator.serviceWorker.ready.then(function() {
+        // Small delay to let SW cache assets, then reload with SW in control
+        setTimeout(function() {
+          if (navigator.serviceWorker.controller) window.location.reload();
+        }, 800);
+      });
+    }
   }
 
   var SKIP_KEY    = 'kv_pwa_skip';

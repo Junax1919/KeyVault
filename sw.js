@@ -1,26 +1,49 @@
-// KeyVault Service Worker v2
-const CACHE = 'keyvault-v2';
-const ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
+// KeyVault Service Worker — v3 (force cache clear)
+var CACHE = 'keyvault-v3';
+var ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
-self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));
-  self.skipWaiting();
-});
-
-self.addEventListener('activate', e => {
+// On install: cache all assets fresh
+self.addEventListener('install', function(e) {
   e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    )
+    caches.open(CACHE).then(function(c) { return c.addAll(ASSETS); })
   );
-  self.clients.claim();
+  self.skipWaiting(); // activate immediately, don't wait
 });
 
-self.addEventListener('fetch', e => {
+// On activate: DELETE all old caches (v1, v2, etc.)
+self.addEventListener('activate', function(e) {
+  e.waitUntil(
+    caches.keys().then(function(keys) {
+      return Promise.all(
+        keys.filter(function(k) { return k !== CACHE; })
+            .map(function(k) {
+              console.log('[SW] Deleting old cache:', k);
+              return caches.delete(k);
+            })
+      );
+    })
+  );
+  self.clients.claim(); // take control of all open tabs immediately
+});
+
+// On fetch: serve from cache, fallback to network
+self.addEventListener('fetch', function(e) {
+  // Never cache Apps Script calls or external resources
   if (e.request.url.includes('script.google.com') ||
       e.request.url.includes('googleapis.com') ||
-      e.request.method === 'POST') return;
+      e.request.url.includes('fonts.gstatic.com') ||
+      e.request.method !== 'GET') return;
+
   e.respondWith(
-    caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match('./index.html')))
+    caches.match(e.request).then(function(cached) {
+      return cached || fetch(e.request).then(function(response) {
+        // Cache new resources on the fly
+        var clone = response.clone();
+        caches.open(CACHE).then(function(c) { c.put(e.request, clone); });
+        return response;
+      });
+    }).catch(function() {
+      return caches.match('./index.html');
+    })
   );
 });
