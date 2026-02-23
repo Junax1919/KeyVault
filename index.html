@@ -1131,30 +1131,31 @@ const S = {
    Paste your Apps Script /exec URL below.
    Get it: Apps Script -> Deploy -> Manage Deployments -> copy URL
 ───────────────────────────────────────────────── */
-var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxJMX-E9esulIwx_7ywPMlw-0I3BQG3ameOgMXpKC94Mko7d8aQTYo3VXTyHw7wGiPf/exec';
+var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzFG-Bl_i0ehguVBUbteVcLT4-mJ5JrARbfLvt6mnJiZ3WMNRizpDNnkLctp6lYJhuZ/exec';
 
 /* ─────────────────────────────────────────────────
-   SERVER CALLS — fetch POST to Apps Script doPost()
+   SERVER CALLS — GET request to Apps Script doGet()
+   WHY GET: Apps Script redirects all requests.
+   POST bodies are dropped on redirect → HTTP 405.
+   GET params survive redirects perfectly.
 ───────────────────────────────────────────────── */
 function call(fnName) {
   var args = Array.prototype.slice.call(arguments, 1);
-  return fetch(APPS_SCRIPT_URL, {
-    method:   'POST',
-    redirect: 'follow',
-    headers:  { 'Content-Type': 'text/plain;charset=utf-8' },
-    body:     JSON.stringify({ fn: fnName, args: args })
-  })
-  .then(function(r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  })
-  .then(function(r) {
-    if (r && r.sessionExpired) doLogout();
-    return r;
-  })
-  .catch(function(e) {
-    return { ok: false, msg: 'Connection error — check APPS_SCRIPT_URL. ' + e.message };
-  });
+  var url  = APPS_SCRIPT_URL
+             + '?fn=' + encodeURIComponent(fnName)
+             + '&p='  + encodeURIComponent(JSON.stringify(args));
+  return fetch(url, { method: 'GET', redirect: 'follow' })
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(r) {
+      if (r && r.sessionExpired) doLogout();
+      return r;
+    })
+    .catch(function(e) {
+      return { ok: false, msg: 'Connection error: ' + e.message };
+    });
 }
 
 /* ─────────────────────────────────────────────────
