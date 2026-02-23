@@ -1136,196 +1136,88 @@ const S = {
    Get it: Apps Script -> Deploy -> Manage Deployments -> copy URL
 ───────────────────────────────────────────────── */
 /* ═══════════════════════════════════════════════════════════
-   STANDALONE PWA — LOCAL STORAGE BACKEND
+   APPS SCRIPT BRIDGE — iframe + postMessage
    
-   Apps Script /exec URLs redirect and drop all query params,
-   breaking both fetch() and JSONP from external domains.
+   How it works:
+   1. PWA loads your Apps Script URL as a hidden iframe (?bridge=1)
+   2. The iframe is same-origin with Apps Script so google.script.run works
+   3. PWA sends requests via postMessage (works cross-origin, no CORS)
+   4. Bridge calls google.script.run, gets result, postMessages it back
+   5. PWA receives the result and resolves the Promise
    
-   This PWA stores all data locally in the browser using
-   localStorage with AES-style XOR encryption keyed to
-   your master password. No server needed — works 100% offline.
-   Your data lives on YOUR device, never on a third-party server.
+   Paste your Apps Script /exec URL below — that's the only config needed.
 ═══════════════════════════════════════════════════════════ */
+var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx4uiCNv4FDGKxGnNk4x8sjPbTNGEKCferfqUpU31kBQeXjEmahBPyzUFWon3JeCdOX/exec';
 
-/* ── Encryption helpers ─────────────────────────────────── */
-function kvEncrypt(text, key) {
-  if (!text) return '';
-  var out = '', k = key + 'kv2024salt';
-  for (var i = 0; i < text.length; i++) {
-    out += String.fromCharCode(text.charCodeAt(i) ^ k.charCodeAt(i % k.length));
-  }
-  return btoa(unescape(encodeURIComponent(out)));
-}
+/* ── Bridge state ───────────────────────────────────────── */
+var _bridge        = null;   // the hidden iframe element
+var _bridgeReady   = false;  // true once iframe fires bridgeReady
+var _pending       = {};     // waiting promises: { id: {resolve, timer} }
+var _bridgeQueue   = [];     // queued calls before bridge is ready
+var _callId        = 0;
 
-function kvDecrypt(enc, key) {
-  if (!enc) return '';
-  try {
-    var text = decodeURIComponent(escape(atob(enc)));
-    var out  = '', k = key + 'kv2024salt';
-    for (var i = 0; i < text.length; i++) {
-      out += String.fromCharCode(text.charCodeAt(i) ^ k.charCodeAt(i % k.length));
+/* ── Boot the bridge iframe ─────────────────────────────── */
+function initBridge() {
+  if (_bridge) return;
+  _bridge = document.createElement('iframe');
+  _bridge.src     = APPS_SCRIPT_URL + '?bridge=1';
+  _bridge.style   = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;top:-9999px';
+  _bridge.sandbox = 'allow-scripts allow-same-origin allow-forms';
+  document.body.appendChild(_bridge);
+
+  window.addEventListener('message', function(e) {
+    var msg = e.data;
+    if (!msg) return;
+
+    // Bridge signals it is ready
+    if (msg.bridgeReady) {
+      _bridgeReady = true;
+      // Flush any calls that arrived before bridge was ready
+      _bridgeQueue.forEach(function(item) { sendToBridge(item.id, item.fn, item.args); });
+      _bridgeQueue = [];
+      return;
     }
-    return out;
-  } catch(e) { return ''; }
-}
 
-function kvHash(str) {
-  // Simple deterministic hash for password verification
-  var h = 5381;
-  for (var i = 0; i < str.length; i++) {
-    h = ((h << 5) + h) ^ str.charCodeAt(i);
-    h = h & 0x7fffffff;
-  }
-  return h.toString(36) + str.length.toString(36) + 'kv';
-}
-
-/* ── Local storage keys ─────────────────────────────────── */
-var LS_HASH    = 'kv_pw_hash';
-var LS_ENTRIES = 'kv_entries';
-var LS_SESSION = 'kv_session';
-var _masterKey = null;  // held in memory only, cleared on logout
-
-/* ── call() — now resolves locally, no network ─────────── */
-function call(fnName) {
-  var args = Array.prototype.slice.call(arguments, 1);
-  return new Promise(function(resolve) {
-    setTimeout(function() {
-      var r = localCall(fnName, args);
-      resolve(r);
-    }, 0);
+    // Result coming back from bridge
+    if (msg.id && _pending[msg.id]) {
+      var p = _pending[msg.id];
+      clearTimeout(p.timer);
+      delete _pending[msg.id];
+      p.resolve(msg.result);
+    }
   });
 }
 
-function localCall(fn, args) {
-  switch(fn) {
-    case 'svr_login':       return local_login(args[0], args[1]);
-    case 'svr_getEntries':  return local_getEntries(args[0]);
-    case 'svr_saveEntry':   return local_saveEntry(args[0], args[1]);
-    case 'svr_updateEntry': return local_updateEntry(args[0], args[1]);
-    case 'svr_deleteEntry': return local_deleteEntry(args[0], args[1]);
-    default: return { ok: false, msg: 'Unknown: ' + fn };
-  }
+/* ── Send a message to the bridge ───────────────────────── */
+function sendToBridge(id, fn, args) {
+  _bridge.contentWindow.postMessage({ id: id, fn: fn, args: args }, '*');
 }
 
-/* ── Auth ───────────────────────────────────────────────── */
-function local_login(username, password) {
-  var DEFAULT_USER = 'admin';
-  var DEFAULT_PASS = 'vault2024';
+/* ── Main call() — same API as before ───────────────────── */
+function call(fnName) {
+  var args = Array.prototype.slice.call(arguments, 1);
 
-  var storedHash = localStorage.getItem(LS_HASH);
+  // Start the bridge iframe on first call
+  if (!_bridge) initBridge();
 
-  if (!storedHash) {
-    // First run — accept defaults and save hash
-    if (username !== DEFAULT_USER || password !== DEFAULT_PASS) {
-      return { ok: false, msg: 'Incorrect username or password.' };
+  return new Promise(function(resolve) {
+    var id = 'c' + (++_callId) + '_' + Date.now();
+
+    // Timeout after 25s
+    var timer = setTimeout(function() {
+      delete _pending[id];
+      resolve({ ok: false, msg: 'Request timed out. Is your Apps Script URL correct and deployed as Anyone?' });
+    }, 25000);
+
+    _pending[id] = { resolve: resolve, timer: timer };
+
+    if (_bridgeReady) {
+      sendToBridge(id, fnName, args);
+    } else {
+      // Queue until bridge fires bridgeReady
+      _bridgeQueue.push({ id: id, fn: fnName, args: args });
     }
-    localStorage.setItem(LS_HASH, kvHash(DEFAULT_USER + ':' + DEFAULT_PASS));
-  } else {
-    if (kvHash(username + ':' + password) !== storedHash) {
-      return { ok: false, msg: 'Incorrect username or password.' };
-    }
-  }
-
-  // Session token — held in memory AND sessionStorage (survives refresh, not close)
-  var session = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-  _masterKey  = password;  // used to decrypt entries
-  sessionStorage.setItem(LS_SESSION, session + '|' + password);
-  return { ok: true, session: session };
-}
-
-function checkLocalSession(session) {
-  if (!session) return false;
-  var stored = sessionStorage.getItem(LS_SESSION);
-  if (!stored) return false;
-  var parts = stored.split('|');
-  if (parts[0] !== session) return false;
-  _masterKey = parts.slice(1).join('|');
-  return true;
-}
-
-/* ── Entries ────────────────────────────────────────────── */
-function local_getEntries(session) {
-  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
-  try {
-    var raw  = localStorage.getItem(LS_ENTRIES);
-    if (!raw) return { ok: true, entries: [] };
-    var enc  = JSON.parse(raw);
-    var entries = enc.map(function(e) {
-      return {
-        id:       e.id,
-        title:    kvDecrypt(e.title,    _masterKey),
-        username: kvDecrypt(e.username, _masterKey),
-        password: kvDecrypt(e.password, _masterKey),
-        category: kvDecrypt(e.category, _masterKey),
-        url:      kvDecrypt(e.url,      _masterKey),
-        notes:    kvDecrypt(e.notes,    _masterKey),
-        createdAt: e.createdAt,
-        updatedAt: e.updatedAt
-      };
-    });
-    return { ok: true, entries: entries };
-  } catch(e) { return { ok: false, msg: e.message }; }
-}
-
-function local_saveEntry(session, entry) {
-  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
-  try {
-    var raw = localStorage.getItem(LS_ENTRIES);
-    var enc = raw ? JSON.parse(raw) : [];
-    var now = new Date().toISOString();
-    var id  = 'kv_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-    enc.push({
-      id:        id,
-      title:     kvEncrypt(entry.title    || '', _masterKey),
-      username:  kvEncrypt(entry.username || '', _masterKey),
-      password:  kvEncrypt(entry.password || '', _masterKey),
-      category:  kvEncrypt(entry.category || '', _masterKey),
-      url:       kvEncrypt(entry.url      || '', _masterKey),
-      notes:     kvEncrypt(entry.notes    || '', _masterKey),
-      createdAt: now, updatedAt: now
-    });
-    localStorage.setItem(LS_ENTRIES, JSON.stringify(enc));
-    return { ok: true, id: id };
-  } catch(e) { return { ok: false, msg: e.message }; }
-}
-
-function local_updateEntry(session, entry) {
-  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
-  try {
-    var raw = localStorage.getItem(LS_ENTRIES);
-    var enc = raw ? JSON.parse(raw) : [];
-    var found = false;
-    for (var i = 0; i < enc.length; i++) {
-      if (enc[i].id === entry.id) {
-        enc[i] = {
-          id:        entry.id,
-          title:     kvEncrypt(entry.title    || '', _masterKey),
-          username:  kvEncrypt(entry.username || '', _masterKey),
-          password:  kvEncrypt(entry.password || '', _masterKey),
-          category:  kvEncrypt(entry.category || '', _masterKey),
-          url:       kvEncrypt(entry.url      || '', _masterKey),
-          notes:     kvEncrypt(entry.notes    || '', _masterKey),
-          createdAt: enc[i].createdAt,
-          updatedAt: new Date().toISOString()
-        };
-        found = true; break;
-      }
-    }
-    if (!found) return { ok: false, msg: 'Entry not found.' };
-    localStorage.setItem(LS_ENTRIES, JSON.stringify(enc));
-    return { ok: true };
-  } catch(e) { return { ok: false, msg: e.message }; }
-}
-
-function local_deleteEntry(session, id) {
-  if (!checkLocalSession(session)) return { ok: false, sessionExpired: true, msg: 'Session expired.' };
-  try {
-    var raw = localStorage.getItem(LS_ENTRIES);
-    var enc = raw ? JSON.parse(raw) : [];
-    var filtered = enc.filter(function(e) { return e.id !== id; });
-    localStorage.setItem(LS_ENTRIES, JSON.stringify(filtered));
-    return { ok: true };
-  } catch(e) { return { ok: false, msg: e.message }; }
+  });
 }
 
 /* ─────────────────────────────────────────────────
@@ -1375,8 +1267,10 @@ function hideErr() { document.getElementById('loginErr').classList.remove('show'
 
 function doLogout() {
   S.sessionHash = null; S.entries = [];
-  _masterKey = null;
-  sessionStorage.removeItem('kv_session');
+  _bridge = null; _bridgeReady = false; _bridgeQueue = []; _pending = {};
+  // Remove bridge iframe if present
+  var old = document.getElementById('kv-bridge');
+  if (old) old.remove();
   document.getElementById('loginUser').value = '';
   document.getElementById('loginPass').value = '';
   hideErr();

@@ -1,5 +1,5 @@
 // KeyVault Service Worker — v3 (force cache clear)
-var CACHE = 'keyvault-v3';
+var CACHE = 'keyvault-v4';
 var ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 // On install: cache all assets fresh
